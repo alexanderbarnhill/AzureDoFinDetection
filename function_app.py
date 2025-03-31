@@ -1,7 +1,10 @@
+import base64
+import io
 import os
 import json
 from email.mime import image
 from io import BytesIO
+from typing import List
 
 import azure.functions as func
 import requests
@@ -14,12 +17,12 @@ import tempfile
 app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
 
 
-def get_file(container, path):
+def get_file(container, path, connection_string_env_var: str):
     """Fetch image from Azure Blob Storage and retain IPTC metadata"""
     # Get connection string from environment variable
-    connection_string = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
+    connection_string = os.getenv(connection_string_env_var)
     if not connection_string:
-        raise ValueError("AZURE_STORAGE_CONNECTION_STRING is not set")
+        raise ValueError(f"{connection_string_env_var} is not set")
 
     # Create a BlobServiceClient
     service_client = BlobServiceClient.from_connection_string(connection_string)
@@ -47,13 +50,13 @@ def get_file(container, path):
         info = None
 
     # Load the image into PIL after extracting metadata
-    image = Image.open(BytesIO(blob_bytes))
-    print(f"Image size: {image.size}")
+    img = Image.open(BytesIO(blob_bytes))
+    print(f"Image size: {img.size}")
 
     # Clean up the temporary file after reading metadata
     os.remove(temp_file_path)
 
-    return image, info
+    return img, info
 
 
 def detect(_image: Image):
@@ -114,8 +117,57 @@ def get_id(_image: Image, path: str, info: IPTCInfo, id_field=None, folder_id_id
     return identifier
 
 
+def load_image_from_base64(base64_string):
+    image_data = base64.b64decode(base64_string)
+    _image = Image.open(BytesIO(image_data))
+    return _image
+
+
+def write_output(
+        source: str,
+        connection_string_env_variable: str,
+        container: str,
+        folder: str,
+        detections: List[str],
+        identifier: str | None):
+    if identifier is None:
+        return
+
+    connection_string = os.getenv(connection_string_env_variable)
+    if not connection_string:
+        raise ValueError(f"{connection_string_env_variable} is not set")
+
+    service_client = BlobServiceClient.from_connection_string(connection_string)
+    container_client = service_client.get_container_client(container)
+    paths = []
+    for idx, detection in enumerate(detections):
+        path_basename = os.path.basename(source).split(".")[0] + f"_cropped_{idx}.JPG"
+        path = os.path.join(folder, identifier, path_basename)
+        print(f"Writing detection to {path}")
+        blob_client = container_client.get_blob_client(path)
+        img = load_image_from_base64(detection)
+        img_data = get_image_data(img)
+        blob_client.upload_blob(img_data, overwrite=True)
+        print(f"Image persisted.")
+        paths.append(path)
+    return paths
+
+def get_image_data(img: Image):
+    fp = io.BytesIO()
+    img.save(fp, format="JPEG")
+    fp.seek(0)
+    return fp
+
+
 @app.route(route="process_file", methods=["GET"])
 def process_file_function(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Expected parameters:
+    container: Source container
+
+    :param req:
+    :return:
+    """
     try:
         print("Params:", req.params)
         # Get query parameters
@@ -123,6 +175,14 @@ def process_file_function(req: func.HttpRequest) -> func.HttpResponse:
         path = req.params.get("path")
         id_field = req.params.get("id_field")
         folder_id_idx = req.params.get("folder_id_idx")
+        connection_string_input_env_var = req.params.get("con_env_in")
+        connection_string_output_env_var = req.params.get("con_env_out")
+        container_out = req.params.get("container_out")
+        folder_out = req.params.get("folder_out")
+
+
+
+
         # Validate query parameters
         if not container or not path:
             return func.HttpResponse(
@@ -132,12 +192,27 @@ def process_file_function(req: func.HttpRequest) -> func.HttpResponse:
             )
 
         # Fetch file paths
-        _image, _iptc = get_file(container, path)
+        _image, _iptc = get_file(container, path, connection_string_input_env_var)
         detections = detect(_image)
         identifier = get_id(_image, path, _iptc, id_field, folder_id_idx)
 
+        output_paths = write_output(
+            detections=detections,
+            container=container_out,
+            identifier=identifier,
+            folder=folder_out,
+            connection_string_env_variable=connection_string_output_env_var,
+            source=path
+        )
+
         return func.HttpResponse(
-            json.dumps({"container": container, "path": path, "detections": detections, "identifier": identifier}),
+            json.dumps({
+                "container": container,
+                "path": path,
+                "detections": detections,
+                "identifier": identifier,
+                "output_paths": output_paths
+            }),
             status_code=200,
             mimetype="application/json"
         )
