@@ -16,7 +16,8 @@
 '&con_env_in=', pipeline().parameters.con_env_in,
 '&con_env_out=', pipeline().parameters.con_env_out,
 '&folder_out=', pipeline().parameters.folder_out,
-'&container_out=', pipeline().parameters.container_out
+'&container_out=', pipeline().parameters.container_out,
+'&only_single=', pipeline().parameters.only_single
 )
 ```
 **Function Key**: 

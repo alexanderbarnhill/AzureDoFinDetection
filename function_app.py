@@ -142,7 +142,7 @@ def get_tag_for_field(field: str) -> int:
     return -1
 
 
-def get_id(_image: Image, path: str, info: IPTCInfo, id_field=None, folder_id_idx=None):
+def get_id(_image: Image, path: str, info: IPTCInfo, id_field=None, id_idx=None, field_seperator="/"):
     """
     Retrieve the unique identifier for the image based on IPTC metadata or folder structure.
 
@@ -151,14 +151,18 @@ def get_id(_image: Image, path: str, info: IPTCInfo, id_field=None, folder_id_id
         path (str): The path to the image in the blob storage.
         info (IPTCInfo): The IPTC metadata extracted from the image.
         id_field (str, optional): The field name to use for retrieving the ID.
-        folder_id_idx (int, optional): Index of folder name to use as ID.
+        id_idx (int, optional): Index of folder name to use as ID.
 
     Returns:
         str | None: The identifier, if available.
     """
     if id_field == "folder":
-        if folder_id_idx is not None:
-            return path.split("/")[int(folder_id_idx)]
+        if id_idx is not None:
+            return path.split("/")[int(id_idx)]
+        return None
+    if id_field == "file":
+        if id_idx is not None:
+            return os.path.basename(path).split(field_seperator)[int(id_idx)]
         return None
 
     # Get the tag for the specified field
@@ -197,7 +201,8 @@ def write_output(
         container: str,
         folder: str,
         detections: List[str],
-        identifier: str | None
+        identifier: str | None,
+        only_single: bool
 ):
     """
     Write extracted image detections to Azure Blob Storage.
@@ -209,11 +214,20 @@ def write_output(
         folder (str): Target folder to store cropped detections.
         detections (List[str]): List of extracted detections.
         identifier (str | None): The identifier for the image.
+        only_single (bool): Specifying if only single identifiers should be used to write output
 
     Returns:
         list: Paths where cropped images were stored.
     """
     if identifier is None:
+        return
+
+    if "?" in identifier:
+        print(f"Identity not certain. Skipping")
+        return
+
+    if only_single and len(identifier.split(" ")) > 1:
+        print(f"Multiple identifiers detected. Skipping.")
         return
 
     # Get connection string from environment variable
@@ -285,11 +299,13 @@ def process_file_function(req: func.HttpRequest) -> func.HttpResponse:
         container = req.params.get("container")
         path = req.params.get("path")
         id_field = req.params.get("id_field")
-        folder_id_idx = req.params.get("folder_id_idx")
+        id_idx = req.params.get("id_idx")
+        field_seperator = req.params.get("sep")
         connection_string_input_env_var = req.params.get("con_env_in")
         connection_string_output_env_var = req.params.get("con_env_out")
         container_out = req.params.get("container_out")
         folder_out = req.params.get("folder_out")
+        only_single = True if "only_single" in req.params and req.params.get("only_single").lower() == "true" else False
 
         # Validate required query parameters
         if not container or not path:
@@ -306,7 +322,7 @@ def process_file_function(req: func.HttpRequest) -> func.HttpResponse:
         detections = detect(_image)
 
         # Get unique identifier based on folder or metadata
-        identifier = get_id(_image, path, _iptc, id_field, folder_id_idx)
+        identifier = get_id(_image, path, _iptc, id_field, id_idx, field_seperator)
 
         # Write cropped detections to output storage
         output_paths = write_output(
@@ -315,7 +331,8 @@ def process_file_function(req: func.HttpRequest) -> func.HttpResponse:
             identifier=identifier,
             folder=folder_out,
             connection_string_env_variable=connection_string_output_env_var,
-            source=path
+            source=path,
+            only_single=only_single
         )
 
         # Return successful response
