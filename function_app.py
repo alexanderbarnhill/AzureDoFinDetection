@@ -2,6 +2,7 @@ import base64
 import io
 import os
 import json
+import time
 from email.mime import image
 from io import BytesIO
 from typing import List
@@ -13,6 +14,8 @@ from azure.storage.blob import BlobServiceClient
 from iptcinfo3 import IPTCInfo
 
 import tempfile
+
+from requests import RequestException
 
 # Create a Function App with HTTP trigger and function-level authorization
 app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
@@ -71,12 +74,14 @@ def get_file(container, path, connection_string_env_var: str):
     return img, info
 
 
-def detect(_image: Image):
+def detect(_image: Image, max_retries=5, base_delay=1.0):
     """
-    Send an image to a detection endpoint to extract bounding boxes.
+    Send an image to a detection endpoint to extract bounding boxes, using exponential backoff on failure.
 
     Args:
         _image (PIL.Image): The image to be sent to the detection API.
+        max_retries (int): Maximum number of retry attempts.
+        base_delay (float): Base delay in seconds for exponential backoff.
 
     Returns:
         list: List of extracted image detections if available, otherwise an empty list.
@@ -84,22 +89,36 @@ def detect(_image: Image):
     endpoint = os.getenv("DETECT_ENDPOINT")
     if not endpoint:
         raise ValueError("DETECT_ENDPOINT is not set")
+    print(f"Sending image to endpoint {endpoint}")
 
     # Convert PIL image to bytes and preserve the original format
     img_byte_arr = BytesIO()
     _image.save(img_byte_arr, format=_image.format)
     img_bytes = img_byte_arr.getvalue()
 
-    # Send the image to the detection API endpoint
-    response = requests.post(endpoint, files={'file': img_bytes})
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(endpoint, files={'file': img_bytes})
+            print(f"Response status: {response.status_code}")
 
-    # If the request succeeds, parse the response
-    if response.status_code == 200:
-        content = json.loads(response.text)
-        detections = content["response"]["extractedImages"]
-        return detections
+            if response.status_code == 200:
+                content = json.loads(response.text)
+                detections = content["response"]["extractedImages"]
+                return detections
 
-    # Return an empty list if detection failed
+            # Retry on server error
+            if 500 <= response.status_code < 600:
+                raise RequestException(f"Server error: {response.status_code}")
+
+            # Don't retry on client error
+            break
+
+        except RequestException as e:
+            wait_time = base_delay * (2 ** attempt)
+            print(f"Attempt {attempt + 1} failed: {e}. Retrying in {wait_time:.1f} seconds...")
+            time.sleep(wait_time)
+
+    print("Detection failed after retries.")
     return []
 
 
@@ -157,9 +176,15 @@ def get_id(_image: Image, path: str, info: IPTCInfo, id_field=None, id_idx=None,
         str | None: The identifier, if available.
     """
     if id_field == "folder":
-        if id_idx is not None:
-            return path.split("/")[int(id_idx)]
-        return None
+        print(f"Trying to get ID by folder. ID index is: {id_idx}")
+        components = path.split(field_seperator)
+        print(components)
+        if id_idx > len(components) - 1:
+            print(f"Index out of bounds")
+            return None
+        identifier = components[id_idx]
+        print(f"Component at ID index: {identifier}")
+        return identifier
     if id_field == "file":
         if id_idx is not None:
             return os.path.basename(path).split(field_seperator)[int(id_idx)]
@@ -299,7 +324,7 @@ def process_file_function(req: func.HttpRequest) -> func.HttpResponse:
         container = req.params.get("container")
         path = req.params.get("path")
         id_field = req.params.get("id_field")
-        id_idx = req.params.get("id_idx")
+        id_idx = int(req.params.get("id_idx"))
         field_seperator = req.params.get("sep")
         connection_string_input_env_var = req.params.get("con_env_in")
         connection_string_output_env_var = req.params.get("con_env_out")
